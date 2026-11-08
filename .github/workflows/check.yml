@@ -2,10 +2,14 @@ name: iCourse Check
 
 on:
   schedule:
-    # Every day at 19:36 BTC (UTC + 8)
+    # Every day at 20:18 BJT (UTC + 8)
     # 设计这个奇怪的时间是为了避免整点时的github队列峰值，避免排队过久。
     - cron: "18 12 * * *"
   workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/check.yml"
 
 permissions:
   contents: write
@@ -65,18 +69,10 @@ jobs:
       - name: Fetch database from data branch
         run: |
           mkdir -p data
-          # Force-fetch (+refspec) so non-fast-forward updates from
-          # force-pushed data branches are picked up (shallow clone
-          # otherwise refuses to overwrite the stale tracking ref).
           git fetch --depth=1 origin "+refs/heads/data:refs/remotes/origin/data" 2>/dev/null \
             || { echo "No data branch, starting fresh."; exit 0; }
-          # Use ls-tree (reads tree directly) instead of cat-file
-          # (requires fetched blobs) in case the shallow clone hasn't
-          # fetched every blob object yet.
           git ls-tree origin/data --name-only data/ | grep -q . \
             || { echo "No database found on data branch, starting fresh."; exit 0; }
-          # Determine format from tree listing (ls-tree reads tree
-          # objects directly without needing the blobs fetched).
           files=$(git ls-tree origin/data --name-only data/ | tr '\n' ' ')
           echo "Data branch files: $files"
           if echo "$files" | grep -q "icourse-index.enc"; then
@@ -88,69 +84,20 @@ jobs:
               git show "origin/data:$path" > "data/sharded/shards/$base"
             done
             echo "Loaded $(ls data/sharded/shards 2>/dev/null | wc -l) shard(s)."
-          elif echo "$files" | grep -q "icourse.db.gz.enc"; then
-            git show origin/data:data/icourse.db.gz.enc > data/icourse.db.gz.enc
-            echo "Loaded legacy compressed database."
-          elif echo "$files" | grep -q "icourse.db.enc"; then
-            git show origin/data:data/icourse.db.enc > data/icourse.db.enc
-            echo "Loaded legacy uncompressed database."
           else
-            echo "No database found on data branch, starting fresh."
+            echo "No sharded database found on data branch, starting fresh."
           fi
 
       - name: Decode database
-        if: hashFiles('data/sharded/icourse-index.enc', 'data/icourse.db.gz.enc', 'data/icourse.db.enc') != ''
+        if: hashFiles('data/sharded/icourse-index.enc') != ''
         env:
           STUID: ${{ secrets.STUID }}
           UISPSW: ${{ secrets.UISPSW }}
           DASHSCOPE_API_KEY: ${{ secrets.DASHSCOPE_API_KEY }}
           SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
         run: |
-          if [ -f data/sharded/icourse-index.enc ]; then
-            # Sharded format — always v2.
-            python scripts/db_shard.py reassemble data/sharded data/icourse.db
-            echo "Reassembled sharded database."
-            exit 0
-          fi
-
-          # Legacy single-file path (one-time migration on first sharded run).
-          NEW_KEY=$(printf '%s' "ICSv2:${STUID}:${UISPSW}" | sha256sum | cut -d' ' -f1)
-          LEGACY_KEY="${STUID}${UISPSW}${DASHSCOPE_API_KEY}${SMTP_PASSWORD}"
-
-          decrypt_blob() {
-            local in_path="$1"
-            local out_path="$2"
-            if openssl enc -aes-256-cbc -d -pbkdf2 -iter 100000 \
-                 -in "$in_path" -out "$out_path" \
-                 -pass pass:"$NEW_KEY" 2>/dev/null; then
-              echo "v2"
-              return 0
-            fi
-            if openssl enc -aes-256-cbc -d -pbkdf2 \
-                 -in "$in_path" -out "$out_path" \
-                 -pass pass:"$LEGACY_KEY" 2>/dev/null; then
-              echo "legacy"
-              return 0
-            fi
-            return 1
-          }
-
-          if [ -f data/icourse.db.gz.enc ]; then
-            if VER=$(decrypt_blob data/icourse.db.gz.enc data/icourse.db.gz); then
-              gzip -d data/icourse.db.gz
-              echo "Legacy compressed DB decrypted ($VER)."
-            else
-              echo "::warning::Decryption failed (both keys). Starting with fresh database."
-              rm -f data/icourse.db data/icourse.db.gz
-            fi
-          elif [ -f data/icourse.db.enc ]; then
-            if VER=$(decrypt_blob data/icourse.db.enc data/icourse.db); then
-              echo "Legacy uncompressed DB decrypted ($VER)."
-            else
-              echo "::warning::Decryption failed (both keys). Starting with fresh database."
-              rm -f data/icourse.db
-            fi
-          fi
+          python scripts/db_shard.py reassemble data/sharded data/icourse.db
+          echo "Reassembled sharded database."
 
       - name: Record database state
         id: db-before
@@ -171,14 +118,13 @@ jobs:
           SMTP_EMAIL: ${{ secrets.SMTP_EMAIL }}
           SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
           RECEIVER_EMAIL: ${{ secrets.RECEIVER_EMAIL }}
-          # All secrets, JSON-encoded. provider_env.py exports only the
-          # vars named by config.MODEL_PROVIDERS (api_key_env /
-          # base_url_env), so user-defined providers with custom env-var
-          # names work without editing this workflow.
-          SECRETS_CONTEXT: ${{ toJSON(secrets) }}
+          DASHSCOPE_API_KEY: ${{ secrets.DASHSCOPE_API_KEY }}
+          DASHSCOPE_BASE_URL: ${{ secrets.DASHSCOPE_BASE_URL }}
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+          DEEPSEEK_BASE_URL: ${{ secrets.DEEPSEEK_BASE_URL }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GEMINI_BASE_URL: ${{ secrets.GEMINI_BASE_URL }}
         run: |
-          eval "$(python scripts/provider_env.py)"
-          unset SECRETS_CONTEXT
           python -u main.py
 
       - name: Deploy database to data branch
@@ -187,10 +133,6 @@ jobs:
           STUID: ${{ secrets.STUID }}
           UISPSW: ${{ secrets.UISPSW }}
           COURSE_IDS: ${{ secrets.COURSE_IDS }}
-          # Persisted by the sharder into meta('subscribed_course_ids')
-          # so single_run.yml / delete_course.yml (which run with a
-          # different or no COURSE_IDS) still know the user's real
-          # subscription and don't reclassify everything as cold.
           SUBSCRIBED_COURSE_IDS: ${{ secrets.COURSE_IDS }}
           DASHSCOPE_API_KEY: ${{ secrets.DASHSCOPE_API_KEY }}
           SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
@@ -207,8 +149,6 @@ jobs:
             exit 0
           fi
 
-          # Pull the latest remote shards (a concurrent run may have written
-          # new data) and merge our local changes in before re-sharding.
           git fetch origin data --depth=1 2>/dev/null || echo "No data branch yet."
           DEPLOY_DB=data/icourse.db
           if git rev-parse origin/data >/dev/null 2>&1 && \
@@ -227,7 +167,6 @@ jobs:
             DEPLOY_DB=data/remote.db
           fi
 
-          # Re-shard the merged DB and stage to a clean tree for force-push.
           rm -rf data/sharded_out
           mkdir -p data/sharded_out
           python scripts/db_shard.py shard "$DEPLOY_DB" data/sharded_out
